@@ -1,15 +1,16 @@
 bl_info = {
-    "name": "Fast-forward timelapse (old version)",
+    "name": "Fast-forward timelapse",
     "author": "Bart Nagel",
-    "version": (0, 1, 0),
-    "blender": (5, 1, 0),
+    "version": (0, 3, 0),
+    "blender": (5, 2, 0),
     "location": "Sequencer > Strip > Retiming",
-    "description": "Calculate timelapse retiming markers",
+    "description": "Add timelapse retiming keys",
     "category": "Sequencer",
 }
 
 import bpy
-from bpy.props import IntProperty
+import math
+from bpy.props import IntProperty, FloatProperty, EnumProperty
 
 
 # ----------------------------------------------------------------------
@@ -20,67 +21,81 @@ def calculate_timelapse(strip, scene, output_frames=None):
     fps = scene.render.fps / scene.render.fps_base
 
     source_frames = strip.duration
-    source_seconds = source_frames / fps
 
     RAMP_FRACTION = 0.2      # each ramp, as a fraction of output length
     RAMP_CAP_SECONDS = 2.0   # each ramp, hard cap in seconds
+    MIN_OUTPUT_SECONDS = 3   # shortest auto-selected output length
 
-    def ramp_seconds_for(out_seconds):
-        # each ramp (up or down) individually = lesser of fraction or cap
-        return min(RAMP_FRACTION * out_seconds, RAMP_CAP_SECONDS)
+    def ramp_frames_for(out_frames):
+        by_fraction = RAMP_FRACTION * out_frames
+        by_cap = RAMP_CAP_SECONDS * fps
+        return round(min(by_fraction, by_cap))
 
-    def speed_for(out_seconds):
-        t_r = ramp_seconds_for(out_seconds)
-        # S = t_r + speed * (Y - t_r)   [see derivation note below]
-        return (source_seconds - t_r) / (out_seconds - t_r)
+    def speed_for(out_frames):
+        rf = ramp_frames_for(out_frames)
+        return (source_frames - rf) / (out_frames - rf)
 
-    def max_source_for(out_seconds, max_speed=64):
-        t_r = ramp_seconds_for(out_seconds)
-        return t_r + max_speed * (out_seconds - t_r)
+    def max_source_for(out_frames, max_speed=64):
+        rf = ramp_frames_for(out_frames)
+        return rf + max_speed * (out_frames - rf)
 
     if output_frames is None:
-        max_at_5s = max_source_for(5)
-        max_at_10s = max_source_for(10)
+        min_frames = round(MIN_OUTPUT_SECONDS * fps)
+        cap_frames = round(10 * fps)
 
-        if source_seconds <= max_at_5s:
-            output_seconds = 5
-            speed = speed_for(output_seconds)
+        if source_frames <= max_source_for(min_frames):
+            output_frames = min_frames
 
-        elif source_seconds <= max_at_10s:
+        elif source_frames <= max_source_for(cap_frames):
             speed = 64
-            t_r = ramp_seconds_for(10)  # boundary value; see note
-            output_seconds = (source_seconds + speed * -t_r + t_r) / speed \
-                if False else (source_seconds - t_r) / speed + t_r
-            # simplifies to:
-            output_seconds = t_r + (source_seconds - t_r) / speed
+            rf = ramp_frames_for(cap_frames)
+            output_frames = round(rf + (source_frames - rf) / speed)
 
         else:
-            output_seconds = 10
-            speed = speed_for(output_seconds)
+            output_frames = cap_frames
 
-        output_frames = round(output_seconds * fps)
-
-    output_seconds = output_frames / fps
-    speed = speed_for(output_seconds)
-    ramp_frames = round(ramp_seconds_for(output_seconds) * fps)
-    if ramp_frames % 2:
-        # keep the corner exactly centered; nudge total ramp width to the
-        # nearest even value so both halves match
-        ramp_frames += 1
+    speed = speed_for(output_frames)
+    ramp_frames = ramp_frames_for(output_frames)
 
     output_start = strip.left_handle
     output_end = output_start + output_frames
 
+    half1 = ramp_frames // 2
+    half2 = ramp_frames - half1
+
+    ramp_up_midpoint = output_start + half1
+    ramp_down_midpoint = output_end - half2
+
+    corner_width = ramp_down_midpoint - ramp_up_midpoint
+    ramp_down_midpoint_initial = ramp_up_midpoint + math.floor(speed * corner_width)
+
+    # Each transition handle can be stretched at most `half - 1` frames
+    # before it collides with the next key, per observed behaviour.
+    transition_duration = max(0, min(half1, half2) - 1)
+
     return {
         "output_frames": output_frames,
         "speed": speed,
-        "ramp_up_start": output_start,
-        "ramp_up_midpoint": output_start + ramp_frames // 2,
-        "ramp_up_end": output_start + ramp_frames,
-        "ramp_down_start": output_end - ramp_frames,
-        "ramp_down_midpoint": output_end - ramp_frames // 2,
-        "ramp_down_end": output_end,
+        "ramp_up_midpoint": ramp_up_midpoint,
+        "ramp_down_midpoint_initial": ramp_down_midpoint_initial,
+        "ramp_down_midpoint": ramp_down_midpoint,
+        "transition_duration": transition_duration,
     }
+
+
+def output_frames_for_speed(source_frames, fps, target_speed):
+    RAMP_FRACTION = 0.2
+    RAMP_CAP_SECONDS = 2.0
+    cap_frames = RAMP_CAP_SECONDS * fps
+
+    y_fraction = source_frames / (target_speed * (1 - RAMP_FRACTION) + RAMP_FRACTION)
+
+    if y_fraction * RAMP_FRACTION <= cap_frames:
+        y = y_fraction
+    else:
+        y = cap_frames + (source_frames - cap_frames) / target_speed
+
+    return max(1, round(y))
 
 
 # ----------------------------------------------------------------------
@@ -114,21 +129,36 @@ def validate_selection(context):
 
     return first, None
 
-
 # ----------------------------------------------------------------------
 # Operator
 # ----------------------------------------------------------------------
 
 class FFWD_OT_add_timelapse(bpy.types.Operator):
     bl_idname = "sequencer.ffwd_add_timelapse"
-    bl_label = "Add calculated timelapse retiming markers"
+    bl_label = "Add timelapse retiming keys"
     bl_options = {'REGISTER', 'UNDO'}
 
+    input_mode: EnumProperty(
+        name="Specify",
+        items=[
+            ('FRAMES', "Output Length", "Choose the total output duration"),
+            ('SPEED', "Cruising Speed", "Choose the plateau speed"),
+        ],
+        default='FRAMES',
+        options={'SKIP_SAVE'},
+    )
     output_frames: IntProperty(
         name="Output Length",
         description="Output duration in frames",
-        default=300,
+        default=180,
         min=1,
+        options={'SKIP_SAVE'},
+    )
+    target_speed_percent: FloatProperty(
+        name="Cruising Speed (%)",
+        description="Desired speed during the constant-speed plateau",
+        default=6400.0,
+        min=100.0,
         options={'SKIP_SAVE'},
     )
 
@@ -142,11 +172,17 @@ class FFWD_OT_add_timelapse(bpy.types.Operator):
         result = calculate_timelapse(strip, context.scene)
 
         self.output_frames = result["output_frames"]
+        self.target_speed_percent = result["speed"] * 100
 
         return context.window_manager.invoke_props_dialog(self)
 
     def draw(self, context):
-        self.layout.prop(self, "output_frames")
+        layout = self.layout
+        layout.prop(self, "input_mode", expand=True)
+        if self.input_mode == 'FRAMES':
+            layout.prop(self, "output_frames")
+        else:
+            layout.prop(self, "target_speed_percent")
 
     def execute(self, context):
         strip, error = validate_selection(context)
@@ -155,52 +191,64 @@ class FFWD_OT_add_timelapse(bpy.types.Operator):
             self.report({'ERROR'}, error)
             return {'CANCELLED'}
 
+        strips = list(context.selected_strips)
+        fps = context.scene.render.fps / context.scene.render.fps_base
+
+        if self.input_mode == 'SPEED':
+            output_frames = output_frames_for_speed(
+                strip.duration, fps, self.target_speed_percent / 100,
+            )
+        else:
+            output_frames = self.output_frames
+
         result = calculate_timelapse(
             strip,
             context.scene,
-            self.output_frames,
+            output_frames,
         )
 
         speed_percent = result["speed"] * 100
 
-        markers = [
-            (
-                result["ramp_up_start"],
-                "_ffwd ramp up start",
-            ),
-            (
-                result["ramp_up_midpoint"],
-                "_ffwd ramp up midpoint",
-            ),
-            (
-                result["ramp_up_end"],
-                f"_ffwd ramp up end ({speed_percent:.1f}%)",
-            ),
-            (
-                result["ramp_down_start"],
-                "_ffwd ramp down start",
-            ),
-            (
-                result["ramp_down_midpoint"],
-                "_ffwd ramp down midpoint",
-            ),
-            (
-                result["ramp_down_end"],
-                "_ffwd ramp down end",
-            ),
-        ]
+        context.scene.timeline_markers.new(
+            f"_ffwd set speed to {speed_percent:.2f}%",
+            frame=result["ramp_down_midpoint_initial"],
+        )
+        context.scene.timeline_markers.new(
+            f"_ffwd add transition",
+            frame=result["ramp_up_midpoint"],
+        )
+        context.scene.timeline_markers.new(
+            f"_ffwd add transition",
+            frame=result["ramp_down_midpoint"],
+        )
 
-        for frame, name in markers:
-            context.scene.timeline_markers.new(
-                name,
-                frame=frame,
+        bpy.ops.sequencer.retiming_show()
+
+        for s in strips:
+            for other in strips:
+                other.select = (other is s)
+
+            context.scene.sequence_editor.active_strip = s
+
+            r1 = bpy.ops.sequencer.retiming_key_add(
+                timeline_frame=result["ramp_up_midpoint"],
             )
+            r2 = bpy.ops.sequencer.retiming_key_add(
+                timeline_frame=result["ramp_down_midpoint_initial"],
+            )
+
+        for s in strips:
+            s.select = True
+
+        context.scene.frame_set(result["ramp_down_midpoint_initial"])
+        bpy.ops.sequencer.view_frame()
 
         self.report(
             {'INFO'},
-            f"Added timelapse markers: "
+            f"Added timelapse keys: "
             f"{result['output_frames']} frames, "
-            f"{speed_percent:.1f}% max speed",
+            f"{speed_percent:.2f}% max speed, "
+            f"stretch transitions {result['transition_duration']} frames each side",
         )
 
         return {'FINISHED'}
